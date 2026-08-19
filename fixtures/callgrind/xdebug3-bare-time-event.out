@@ -1,0 +1,29 @@
+version: 1
+creator: xdebug 3.0.4 (PHP 8.0.3)
+cmd: /var/www/html/index.php
+part: 1
+positions: line
+
+events: Time Memory
+
+fl=(1) php:internal
+fn=(1) php::usleep
+7 50000000 0
+
+fl=(2) /var/www/html/index.php
+fn=(2) slowThing
+6 150000 128
+cfl=(1)
+cfn=(1)
+calls=1 0 0
+7 50000000 0
+
+fl=(2)
+fn=(3) {main}
+1 250000 4096
+cfl=(2)
+cfn=(2)
+calls=1 0 0
+12 50150000 128
+
+summary: 50400000 4224

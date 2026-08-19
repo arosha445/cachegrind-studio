@@ -1,0 +1,17 @@
+version: 1
+creator: xdebug 3.5.1 (PHP 8.3.29)
+cmd: /app/killed.php
+part: 1
+positions: line
+
+events: Time_(10ns) Memory_(bytes)
+
+fl=(1) /app/killed.php
+fn=(1) {main}
+1 40 8
+cfl=(1)
+cfn=(2) doWork
+calls=1 0 0
+9 120 16
+cfl=(1)
+cfn=(

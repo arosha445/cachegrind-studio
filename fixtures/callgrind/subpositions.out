@@ -1,0 +1,27 @@
+# callgrind format
+# Not Xdebug output. Exercises relative subposition compression (+n, -n, *),
+# which the Callgrind spec allows and Xdebug never emits. Also exercises the
+# unknown-creator path: no `creator:` line at all.
+version: 1
+cmd: /app/rel.php
+part: 1
+positions: line
+
+events: Time Memory
+
+fl=(1) /app/rel.php
+fn=(1) walker
+10 100 0
++5 200 0
+-3 50 0
+* 25 0
+
+fl=(1)
+fn=(2) {main}
+1 10 0
+cfl=(1)
+cfn=(1)
+calls=1 0 0
+7 375 0
+
+summary: 385 0
