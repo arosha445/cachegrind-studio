@@ -1,0 +1,9 @@
+# Source is stored with LF and checked out however the platform prefers.
+* text=auto eol=lf
+
+# Profile fixtures are byte-exact test data, not text. Line-ending
+# normalisation would change their length and their content between platforms,
+# which is precisely what a parser test corpus must not do. Real Xdebug output
+# on Windows also legitimately contains CRLF, and that is part of what these
+# files exist to prove the parser survives.
+fixtures/callgrind/** -text -diff
