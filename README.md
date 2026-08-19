@@ -1,6 +1,8 @@
 <div align="center">
 
-# Cachegrind Studio
+# Cachegrind Studio   &middot; [![License](https://img.shields.io/github/license/arosha445/cachegrind-studio)](https://github.com/arosha445/cachegrind-studio/blob/main/LICENSE)
+
+
 
 **Turn Xdebug profiles into answers.**
 
