@@ -83,13 +83,16 @@ The bet is that most of what the paid tools sell comes from **knowing which proj
 
 ## How it runs
 
-One parser, three front-ends. Everything reads the same columnar profile out of
-`packages/parser`, so a fact is computed once and reported identically everywhere.
+One parser; everything else is a thin adapter over it. Every mode reads the same columnar
+profile out of `packages/parser`, so a fact is computed once and reported identically
+everywhere — the number in the flame graph, the number asserted in CI, and the number an
+agent reads are the same number from the same code.
 
 | Mode | For | Shape |
 |---|---|---|
 | **UI** | Reading a profile yourself | Local browser app, served by the PHP dev server or opened as a static page |
 | **Headless** | CI, pre-commit hooks, scripts | CLI that emits a JSON report and an exit code |
+| **Test suite** | Catching regressions in review | PHPUnit / Pest extension with snapshot baselines |
 | **MCP** | Coding agents | Stdio server exposing hotspots, diffs and source-aware answers |
 
 Installed in a project, it also keeps a **run store** — profiles labelled with commit,
@@ -140,16 +143,27 @@ is not being dropped in favour of the Composer one — it is the reason the proj
 
 No Composer. No Node. No terminal.
 
-### CI (planned for v0.3)
+### In your test suite (planned for v0.3)
 
-```yaml
-- uses: cachegrind-studio/action@v1
-  with:
-    budget: .cachegrind-studio/budget.yml
+A dedicated performance suite, with the expected counts committed next to the tests:
+
+```json
+// tests/Performance/__snapshots__/CheckoutTest.testGuestCheckout.json
+{ "queries": 5, "autoloads": 182, "calls": 4211, "allocations": 1204 }
 ```
 
-Assertions are on deterministic counts — queries, autoloads, function calls, allocations —
-not on wall-clock time. The reasoning is in [Known limitations](#known-limitations).
+A pull request that introduces an N+1 then shows up **in the diff**, during review, as
+`"queries": 5 → 47` — nobody has to run anything or read a report.
+
+Assertions are on deterministic counts, never wall-clock time; the reasoning is in
+[Known limitations](#known-limitations). Counts come from Xdebug's function monitor rather
+than from the profiler, because the profiler cannot produce per-test data at all — the
+measurements behind that are in [`research/xdebug-overhead/`](research/xdebug-overhead/).
+
+> Instrument a **dedicated, opt-in suite**, not every test. Xdebug's overhead is per-opcode
+> and cannot be optimised away — roughly 1x on I/O-bound time but ~7x on typical application
+> code. If you already run Xdebug for coverage, `xdebug.mode=coverage,develop` costs the same
+> as coverage alone, so monitoring is free.
 
 ### Docker (planned for v1.0)
 
@@ -234,6 +248,9 @@ cachegrind-studio/
 │  └─ php-server/   ⬜ ~300 lines, PHP 7.4+. Discovery, streaming, preflight,
 │                      run store. Never parses anything.                      (v0.15)
 └─ apps/playground/ ⬜ Hosted demo with sample profiles.                       (v1.0)
+
+fixtures/           ✅ Real cachegrind files pinning down format edge cases.
+research/           ✅ Measurements behind design decisions, with scripts to re-run them.
 ```
 
 ✅ built · ⬜ planned.
@@ -266,7 +283,7 @@ code. Any analysis that lands in one front-end and not the others is a design mi
 | **v0.15** | 🚧 next | Live in the project | PHP 7.4+ thin server · preflight status page with generated ini snippets and a re-verify loop · **run store** (labelled runs with commit, branch, route) · `watch` mode · Composer package **and** XAMPP/WAMP drop-in zip from the same code · Windows path handling |
 | **v0.2** |  | Answer "did my change help?" | Profile diffing over the run store · delta flame graph · call tree · regex filtering · run history browser |
 | **v0.25** |  | Let agents in | MCP server (reusing `packages/parser`) reading the run store · `trigger_profile` · source-aware hotspot answers, closing the profile → patch → re-profile → diff loop |
-| **v0.3** |  | Catch it before review | Headless CLI with a stable JSON report and exit code · **count-based assertions** (calls, queries, autoloads, allocations) · GitHub Action · PR comment bot · wall-time reported as advisory only |
+| **v0.3** |  | Catch it before review | **PHPUnit / Pest extension** asserting on a dedicated performance suite · **snapshot baselines** committed alongside tests, so a regression shows up in the PR diff · count-based assertions (queries, autoloads, calls, allocations) · headless CLI with a stable JSON report and exit code · GitHub Action · wall-time advisory only |
 | **v0.4** |  | Understand the shape of the request | Per-package attribution from `composer.json` · framework layer graph · include/require dependency graph · N+1 and smell detection · N+1 cluster view · memory view |
 | **v0.5** |  | Navigate visually and at scale | Focused call graph (React Flow + Dagre/ELK) · self-contained HTML export · DuckDB-WASM query layer · `.xt` trace ingestion + time-order timeline |
 | **v1.0** |  | Fits into a team's workflow | Multi-run aggregation across a whole test suite · budgets tuned against real projects · Docker · docs, playground, agentic demo |
@@ -280,6 +297,8 @@ The sequence changed after v0.1 shipped, for three reasons worth stating outrigh
 **The run store is the load-bearing piece, so it comes first.** Diffing, history, aggregation and budgets all need the same thing: a run that knows what it is. A raw cachegrind file does not — see [run identity](#known-limitations) below. Building the store in v0.15 makes four later milestones possible instead of awkward; building it later means retrofitting every one of them.
 
 **Being inside the project is what unlocks the differentiated features**, not just a nicer install. Source annotation stops needing hand-attached files. `vendor/` versus application code stops being a heuristic and becomes a lookup. Commit and branch come for free, which is what a diff needs to be meaningful.
+
+**CI hangs off the test suite, because that is where run identity is free.** A test name is stable, unique and already meaningful — no middleware, no route capture, no filename specifiers. Tests are also deterministic in a way that a dev HTTP request is not, which is exactly what count assertions need. The mechanics were measured before committing: see [`research/xdebug-overhead/`](research/xdebug-overhead/).
 
 **CI moved earlier but got narrower.** See the budget caveat in [Known limitations](#known-limitations): asserting on wall-clock time from an Xdebug profile produces a flaky check, and a flaky check gets switched off. Assertions are on deterministic counts instead. That is a smaller promise than "performance budgets" and a much more reliable one.
 
@@ -296,6 +315,14 @@ The sequence changed after v0.1 shipped, for three reasons worth stating outrigh
 ## Known limitations
 
 **Xdebug's profiler distorts what it measures.** Overhead is significant and uneven across function types — enough that absolute wall-clock numbers from a profiled run should not be quoted as real-world timings. Trust relative self-cost and call counts. Cachegrind Studio shows this caveat in the UI rather than letting you forget it.
+
+**Instrumenting a whole test suite is not viable, so don't.** Xdebug's overhead is
+per-opcode, not per-function-call — 50,000 calls and a single call over the same work both
+cost about 100x, so it cannot be reduced by restructuring code. In practice it ranges from
+1.0x on I/O-bound time to ~7x on typical application code, which would turn a two-minute
+suite into ten or fifteen. The supported shape is a small, opt-in performance suite. Full
+measurements, and the reason per-test counts come from Xdebug's function monitor rather than
+from the profiler, are in [`research/xdebug-overhead/`](research/xdebug-overhead/).
 
 **CI assertions are on counts, not on time — deliberately.** The point above does not go away in CI; it gets worse, because shared runners add their own variance on top of the profiler's. A wall-clock budget over Xdebug data produces a check that fails on unrelated pull requests, and a check that cries wolf gets switched off within a fortnight. So budgets assert on things that are stable run to run: query counts, autoload counts, function call counts, allocation counts. Those are also what actually regresses — N+1s, autoload storms, an accidental loop. Wall time is reported alongside, as advisory, never as a gate.
 

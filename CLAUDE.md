@@ -21,6 +21,7 @@ packages/
 apps/
   playground/   ⬜ Hosted demo with sample profiles.                       (v1.0)
 fixtures/       ✅ Real cachegrind files used by the test suite. Do not delete.
+research/       ✅ Measurements behind design decisions. Re-run before overturning one.
 ```
 
 ✅ exists today; ⬜ is planned and the directory is not there yet. Do not assume a
@@ -67,8 +68,12 @@ pnpm build                   # static SPA into packages/web/dist
 pnpm fixtures:generate       # re-run the PHP workload under Xdebug, refresh fixtures/callgrind
 ```
 
-`pnpm fixtures:generate` needs a local PHP with Xdebug 3 on `PATH`. It is the only
-command that does; everything else is Node-only.
+```bash
+bash research/xdebug-overhead/run.sh   # reproduce the per-test instrumentation numbers
+```
+
+`pnpm fixtures:generate` and the research scripts need a local PHP with Xdebug 3 on
+`PATH`. They are the only things that do; everything else is Node-only.
 
 There is no `composer test` / `composer analyse` yet — `packages/php-server` does not
 exist. Add them with the package in v0.15.
@@ -109,7 +114,16 @@ The built JS bundle ships *inside* the released package, so release tooling has 
 **7. Everything that runs in a user's project is dev-only, and enforces it.**
 It serves source code and profile data. `composer require --dev`, never `require` — and do not rely on the user getting that right. Bind to loopback only, refuse to start when a production environment is detected, and never auto-register routes into the host application via a service provider. This is cheap to build in now and very awkward to retrofit after someone has shipped it to production.
 
-**8. CI assertions are on counts, never on wall time.**
+**8. Per-test counts come from the function monitor, and the log is read once.**
+Measured in `research/xdebug-overhead/` — read that before touching this area.
+
+- The profiler **cannot** produce per-test data. There is no `xdebug_start_profiling()`, `xdebug.mode` is `PHP_INI_SYSTEM` so it cannot be flipped at runtime, and one cachegrind file is written per *process* — meaning one per suite run, not one per test. Counts come from `xdebug_start_function_monitor()`, the only per-test-capable runtime API, which works in `develop` mode only.
+- A suite-wide profile is not a substitute. It attributes a test's *direct* calls exactly, but any call reached through a shared intermediate has its edges merged across tests and is unrecoverable. Queries are always several layers deep.
+- **Read the monitor log exactly once, at the end of the run.** `xdebug_get_monitored_functions()` returns the entire cumulative log on every call, so reading per test is quadratic: 12.8 s versus 0.49 s at 2,000 tests, and a hard OOM at 8,000. Delimit tests by calling a monitored no-op marker between them and split the log on the marker in one linear pass. Records carry no timestamp, so a marker is the only way to recover boundaries. `research/xdebug-overhead/verify_sentinel.php` proves this is exact; keep it passing.
+- The log cannot be flushed — it is cumulative for the process lifetime, ~0.7 KB per record. Keep the monitored function list tight, and rely on per-process chunking for large suites.
+- Never instrument the whole test suite by default. Xdebug's overhead is **per-opcode, not per-call** (50,000 calls and 1 call over the same work both cost ~100x), so it cannot be optimised away by restructuring code. Real-world cost ranges from 1x for I/O-bound time to ~7x for typical app code. A dedicated, opt-in performance suite is the supported shape.
+
+**9. CI assertions are on counts, never on wall time.**
 Xdebug's overhead is large and uneven (see the profiling-accuracy note below), and CI runners add their own variance on top. A wall-clock budget over Xdebug data fails on unrelated pull requests, and a check that cries wolf gets disabled within a fortnight — at which point the feature is worse than not shipping it. Assert on what is stable run to run: query counts, autoload counts, function call counts, allocation counts. Those are also what actually regresses. Report wall time alongside as advisory, clearly marked, never as a gate. If a request arrives to "just add a time threshold", this is the reason to push back.
 
 ## Format gotchas
@@ -149,6 +163,7 @@ When fixing a parser bug, add a fixture to `fixtures/` reproducing it, and add a
 - Large profiles are **not** committed and not downloaded either. `packages/parser/bench/synthetic.ts` generates a realistically-shaped profile at any size; use it instead of a fixture for anything size-dependent. (There is no `pnpm fixtures:download`.)
 - Performance-sensitive changes need a `pnpm bench` before/after in the PR description.
 - Preflight logic needs tests against synthetic `phpinfo`-style inputs covering: Xdebug absent, Xdebug 2.x, mode misconfigured, `output_dir` missing, `output_dir` unwritable, no profile files present. (Arrives with `packages/php-server` in v0.15.)
+- `research/xdebug-overhead/verify_sentinel.php` must keep passing. It proves per-test call attribution is exact, including through shared intermediates; if it breaks, every count assertion built on it is silently wrong. Wire it into CI once `packages/php-server` exists.
 - Run-store tests need a fixed clock and a fake git, or they will be flaky and machine-dependent. Cover: a project with no git, a detached HEAD, a dirty working tree, two runs of the same route, and retention pruning. (v0.15.)
 - The headless report is a public interface — snapshot-test its shape, not just its values, so a field rename fails loudly rather than silently breaking someone's pipeline. (v0.3.)
 
@@ -197,6 +212,13 @@ Settled after v0.1, when the direction changed to living inside the project:
 - **Both distributions survive.** Composer is the primary route, the drop-in zip is not deprecated. See "Two distributions, one codebase" above.
 - **CI ships in v0.3 with count assertions only.** See invariant 8. This is a deliberate narrowing of what the README used to call "performance budgets".
 - **Graph views (React Flow), HTML export and DuckDB-WASM moved to v0.5.** They are good features that do not unblock anything else; the run-store path does.
+
+Settled by measurement in `research/xdebug-overhead/` (see invariant 8):
+
+- **Test-suite integration is the CI story, not route profiling.** A test name is a stable, unique, human-meaningful run identity that already exists in the codebase — no middleware, no route capture, no filename specifiers. Tests are also deterministic in a way dev HTTP requests are not, which is what count assertions need.
+- **Assertions read the function monitor; the profiler only explains failures.** The profiler cannot produce per-test data at all. Two data sources, two jobs.
+- **A dedicated opt-in performance suite, never blanket instrumentation.** Whole-suite monitoring turns a 2-minute suite into 10–15 minutes.
+- **`coverage,develop` costs the same as `coverage` alone**, so projects already running Xdebug coverage get monitoring for free. That is the adoption path to design toward.
 
 ## Current focus
 
