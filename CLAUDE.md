@@ -4,7 +4,7 @@ Guidance for Claude Code when working in this repository.
 
 ## What this is
 
-**Cachegrind Studio** — a web-based analyzer for PHP Xdebug profiles (`cachegrind.out` files). A replacement for Webgrind and KCachegrind, plus an MCP server so agents can read profiles.
+**Cachegrind Studio** — an analyzer for PHP Xdebug profiles (`cachegrind.out` files) that installs into a PHP project as a dev dependency. A replacement for Webgrind and KCachegrind, with a browser UI, a headless CI mode, and an MCP server so agents can read profiles.
 
 Read `README.md` for user-facing context and the roadmap. This file covers how to work in the codebase.
 
@@ -13,11 +13,13 @@ Read `README.md` for user-facing context and the roadmap. This file covers how t
 ```
 packages/
   parser/       ✅ Framework-free TypeScript. Callgrind bytes → columnar typed arrays.
-  web/          ✅ React 19 SPA. Canvas flame graph. (React Flow graphs land in v0.2.)
-  mcp/          ⬜ Node MCP server. Imports packages/parser.            (v0.4)
-  php-server/   ⬜ ~300 lines, PHP 7.4+. Discovery, streaming, preflight. (v0.15)
+  web/          ✅ React 19 SPA. Canvas flame graph. Front-end #1: the UI.
+  cli/          ⬜ Node. Front-end #2: headless JSON report + exit code.   (v0.3)
+  mcp/          ⬜ Node. Front-end #3: stdio MCP server.                   (v0.25)
+  php-server/   ⬜ ~300 lines, PHP 7.4+. Discovery, streaming, preflight,
+                   run store. Never parses.                               (v0.15)
 apps/
-  playground/   ⬜ Hosted demo with sample profiles.                    (v1.0)
+  playground/   ⬜ Hosted demo with sample profiles.                       (v1.0)
 fixtures/       ✅ Real cachegrind files used by the test suite. Do not delete.
 ```
 
@@ -25,6 +27,31 @@ fixtures/       ✅ Real cachegrind files used by the test suite. Do not delete.
 package exists because this file names it.
 
 pnpm workspaces. Run commands from the repo root unless noted.
+
+## The shape of the product
+
+Since v0.15 the tool is something you **install into a PHP project**, not a standalone
+viewer you feed a file to. That changes what belongs where, so it is worth being explicit:
+
+**One core, three front-ends.** `packages/parser` computes everything. `web`, `cli` and
+`mcp` are thin adapters over the same `bytes → columnar profile` interface. A number in the
+flame graph, a number asserted in CI, and a number an agent reads must be the *same* number
+from the *same* code. Analysis that lands in one front-end and not the others is a design
+mistake — push it down into the parser.
+
+**The run store is what makes the project-installed version worth having.** A raw cachegrind
+file has no identity: `cmd:` is the entry script, which for any framework is the same
+`index.php` for every request. Diffing, history, aggregation and budgets all need a run that
+knows its commit, branch and route. That metadata can only come from outside the file, which
+is the whole argument for living in the repo. It is a directory of plain files
+(`.cachegrind-studio/runs/`, raw bytes plus a small JSON manifest per run) — no daemon, no
+migrations, and a run can be committed or uploaded as a CI artifact as-is.
+
+**Two distributions, one codebase.** The Composer dev-dependency and the XAMPP/WAMP drop-in
+zip are the same PHP server and the same built SPA, packaged differently. The drop-in is not
+deprecated by the Composer route — it reaches people who have no Composer and no terminal,
+and that audience is why the project exists. Anything that only works in one of the two is
+a bug unless it is inherently project-scoped (per-package attribution, git metadata).
 
 ## Commands
 
@@ -58,7 +85,7 @@ These are load-bearing. Breaking them causes the exact failures this project exi
 The flame graph draws to canvas. The function table is virtualized (TanStack Virtual). The call tree renders only what's visible. Rendering N frames as N DOM elements is what makes Webgrind crash — do not reintroduce it. React Flow graph views are the single exception, and only because they are hard-capped at a few hundred curated nodes (see invariant 4).
 
 **2. `packages/parser` never imports from `packages/web`.**
-The parser is shared by the browser, the MCP server, and any future CLI. It must stay free of React, DOM APIs, and Node-only APIs. An ESLint boundary rule enforces this; if you find yourself wanting to relax it, the abstraction is wrong somewhere else.
+The parser is shared by the browser UI, the CLI and the MCP server — all three front-ends. It must stay free of React, DOM APIs, and Node-only APIs. An ESLint boundary rule enforces this; if you find yourself wanting to relax it, the abstraction is wrong somewhere else.
 
 **3. Parsing happens in a Web Worker, over bytes.**
 Read `ArrayBuffer`/`Uint8Array` and scan byte-wise. Never `TextDecoder` the whole file into a string, never `.split('\n')` on the full contents — that is the memory blowup. Decode only name payloads, via `TextDecoder` on subslices. Intern names to integer IDs. Costs go into `Int32Array`/`Float64Array` columns. Transfer results with `postMessage(payload, [transferables])`.
@@ -69,10 +96,21 @@ Subgraphs are built in the Worker over the columnar edge table and returned with
 The flame graph has its own, much larger ceiling (`maxNodes`, 200,000) because it draws to canvas rather than to React Flow. Do not confuse the two numbers. What matters in both cases is that hitting the ceiling **stops the traversal**, not just the emission: an earlier flame builder kept walking a dense call graph after the ceiling and spent 18 s visiting 88 million subtrees. `pnpm bench` has a dense-graph case guarding this.
 
 **5. The PHP server never parses profile data.**
-It lists files, streams raw bytes, serves source files, and reports environment state. If a task seems to need parsing in PHP, it belongs in the parser package instead.
+It lists files, streams raw bytes, serves source files, reports environment state, and maintains the run store. If a task seems to need parsing in PHP, it belongs in the parser package instead. Parsing in PHP is exactly what makes Webgrind fall over.
 
-**6. The drop-in must work with zero tooling.**
-No Composer autoloader, no `node_modules`, no build step at install time. `packages/php-server` uses plain `require`. Target **PHP 7.4**, not 8.1 — XAMPP/WAMP installs lag badly, and that audience is the primary distribution target.
+**6. The drop-in must work with zero tooling, and the Composer package must add zero weight.**
+Two constraints on the same code:
+
+- *Drop-in:* no Composer autoloader, no `node_modules`, no build step at install time. `packages/php-server` uses plain `require`. Target **PHP 7.4**, not 8.1 — XAMPP/WAMP installs lag badly, and that audience is the one that cannot profile at all today.
+- *Composer package:* **zero runtime Composer dependencies.** Not "no framework dependencies" — zero. As a dev dependency it sits in the consumer's dependency graph, and anything it requires can conflict with the host application. The PHP 7.4 floor also stops being merely a target and becomes a compatibility promise: the projects most in need of profiling are the old ones.
+
+The built JS bundle ships *inside* the released package, so release tooling has to build assets. `dist/` stays gitignored; it is a release artifact, not a source file.
+
+**7. Everything that runs in a user's project is dev-only, and enforces it.**
+It serves source code and profile data. `composer require --dev`, never `require` — and do not rely on the user getting that right. Bind to loopback only, refuse to start when a production environment is detected, and never auto-register routes into the host application via a service provider. This is cheap to build in now and very awkward to retrofit after someone has shipped it to production.
+
+**8. CI assertions are on counts, never on wall time.**
+Xdebug's overhead is large and uneven (see the profiling-accuracy note below), and CI runners add their own variance on top. A wall-clock budget over Xdebug data fails on unrelated pull requests, and a check that cries wolf gets disabled within a fortnight — at which point the feature is worse than not shipping it. Assert on what is stable run to run: query counts, autoload counts, function call counts, allocation counts. Those are also what actually regresses. Report wall time alongside as advisory, clearly marked, never as a gate. If a request arrives to "just add a time threshold", this is the reason to push back.
 
 ## Format gotchas
 
@@ -89,6 +127,7 @@ Xdebug's Callgrind output has sharp edges. Most parser bugs are one of these:
 - **Internal functions** are `fl=php:internal` / `fn=php::name`. Includes are pseudo-functions: `require::/path`, `include_once::/path`.
 - **Files are gzipped by default** since Xdebug 3.1 — but `xdebug.use_compression` is a no-op on at least some Windows builds, so do not rely on the setting or the filename. Sniff the `1f 8b` magic bytes.
 - **Memory is a second event column.** Do not assume a single cost value per line. Freed memory legitimately reads as 0.
+- **The file carries no usable run identity.** `cmd:` is the entry script, so every request in a framework app reports the same `index.php`. There is no route, no commit, no test name, and no request time beyond the filename. Anything that compares two runs has to get identity from outside the file — the run store, or `xdebug.profiler_output_name` format specifiers (`%t` timestamp, `%p` pid, and others worth verifying against the Xdebug docs before relying on them). Do not invent identity by hashing the profile contents: two runs of the same route legitimately differ.
 
 When fixing a parser bug, add a fixture to `fixtures/` reproducing it, and add a row to
 `fixtures/README.md` saying what it pins down.
@@ -97,9 +136,10 @@ When fixing a parser bug, add a fixture to `fixtures/` reproducing it, and add a
 
 - TypeScript strict, `noUncheckedIndexedAccess` on. No `any` in `packages/parser`.
 - Prefer plain functions and typed arrays over classes in the parser hot path.
-- Node components in React Flow views must be memoized — React Flow re-renders aggressively.
+- Node components in React Flow views must be memoized — React Flow re-renders aggressively. (React Flow arrives in v0.5, not v0.2.)
 - The graph module is lazy-loaded via route-level dynamic import. Keep it that way; first paint matters for the XAMPP audience on modest hardware.
-- PHP: PSR-12, PHPStan level 8, no framework dependencies.
+- PHP: PSR-12, PHPStan level 8, zero runtime Composer dependencies (invariant 6).
+- The headless report format is a **public interface**. Once a CI pipeline depends on its shape you cannot move it, so version it from the first release and treat changes as breaking.
 - Windows paths are first-class. Backslashes, drive letters, `C:\xampp\tmp`, case-insensitive comparison. Do not assume POSIX.
 
 ## Testing
@@ -109,6 +149,8 @@ When fixing a parser bug, add a fixture to `fixtures/` reproducing it, and add a
 - Large profiles are **not** committed and not downloaded either. `packages/parser/bench/synthetic.ts` generates a realistically-shaped profile at any size; use it instead of a fixture for anything size-dependent. (There is no `pnpm fixtures:download`.)
 - Performance-sensitive changes need a `pnpm bench` before/after in the PR description.
 - Preflight logic needs tests against synthetic `phpinfo`-style inputs covering: Xdebug absent, Xdebug 2.x, mode misconfigured, `output_dir` missing, `output_dir` unwritable, no profile files present. (Arrives with `packages/php-server` in v0.15.)
+- Run-store tests need a fixed clock and a fake git, or they will be flaky and machine-dependent. Cover: a project with no git, a detached HEAD, a dirty working tree, two runs of the same route, and retention pruning. (v0.15.)
+- The headless report is a public interface — snapshot-test its shape, not just its values, so a field rename fails loudly rather than silently breaking someone's pipeline. (v0.3.)
 
 **Known gap:** there is no Playwright E2E suite yet. The v0.1 renderer was verified by
 hand in a browser, including against the production build, but nothing automated asserts
@@ -131,7 +173,7 @@ which is the evidence for *not* reaching for WASM yet.
 
 ## When working on this project
 
-**Ask before:** changing the parser's public interface (`bytes → columnar profile`), adding a dependency to `packages/parser`, raising the PHP version floor, or adding anything to the drop-in that requires a build step.
+**Ask before:** changing the parser's public interface (`bytes → columnar profile`), changing the run-store manifest schema or the headless report format once either has shipped, adding a dependency to `packages/parser`, adding *any* runtime Composer dependency, raising the PHP version floor, or adding anything to the drop-in that requires a build step.
 
 **Don't:** copy code from KCachegrind (GPL-2.0 — this project is a clean-room implementation from the published format spec). speedscope is MIT and may be referenced with attribution.
 
@@ -144,26 +186,42 @@ which is the evidence for *not* reaching for WASM yet.
 Settled during v0.1. Revisit them deliberately, not by accident.
 
 - **No `fflate`.** Gzip uses the platform `DecompressionStream` only. Adding fflate would be the parser's first runtime dependency, and the support floor does not currently need lowering. `packages/parser/src/gzip.ts` has a documented seam where it would go.
-- **Cost values stay in raw file units** everywhere, converted to milliseconds only at render time via `meta.timeToMs`. Summing, diffing and re-aggregating therefore never accumulate rounding error — which matters most for v0.3 diffing.
+- **Cost values stay in raw file units** everywhere, converted to milliseconds only at render time via `meta.timeToMs`. Summing, diffing and re-aggregating therefore never accumulate rounding error — which matters most for diffing in v0.2.
 - **The flame builder does not prune by cost.** `minFraction` defaults to 0 and culling happens at draw time, where the zoom level is known. Dropping a frame at build time makes it unreachable however far the user zooms in, which is exactly when they want it. `maxNodes` is the safety valve, not the threshold.
-- **No TanStack Router and no shadcn/ui yet.** v0.1 is a single view with tab state and a handful of hand-rolled Tailwind components. Router earns its place with the lazy-loaded graph route in v0.2 — that is the moment to add it, and the moment to honour the "graph module is lazy-loaded" convention below.
+- **No TanStack Router and no shadcn/ui yet.** v0.1 is a single view with tab state and a handful of hand-rolled Tailwind components. Router earns its place when the run-history and diff views arrive in v0.2, and again with the lazy-loaded graph route in v0.5.
 - **Columns are typed as `Int32Array<ArrayBuffer>` / `Float64Array<ArrayBuffer>`** (aliases `I32`/`F64`/`U8` in `types.ts`), not the default `ArrayBufferLike`. That is what `postMessage` transfer lists require, and stating it stops a `SharedArrayBuffer` silently turning a zero-copy handoff into a structured clone.
+
+Settled after v0.1, when the direction changed to living inside the project:
+
+- **The run store comes before diffing, not with it.** Diffing, history, aggregation and budgets all need a run that knows its commit, branch and route. Building the store first makes four milestones straightforward; building it later means retrofitting every one of them.
+- **Both distributions survive.** Composer is the primary route, the drop-in zip is not deprecated. See "Two distributions, one codebase" above.
+- **CI ships in v0.3 with count assertions only.** See invariant 8. This is a deliberate narrowing of what the README used to call "performance budgets".
+- **Graph views (React Flow), HTML export and DuckDB-WASM moved to v0.5.** They are good features that do not unblock anything else; the run-store path does.
 
 ## Current focus
 
-See the roadmap table in `README.md`.
+See the roadmap table in `README.md`, which was reordered after v0.1 shipped.
 
 **v0.1 is complete** — Worker parser, canvas flame graph + icicle, function table, source
 annotation, drag-and-drop, static web app. Its success criterion is met with headroom (see
 Current baseline above).
 
-Present milestone: **v0.15** — reach the people who cannot profile today. XAMPP/WAMP
-drop-in zip, PHP 7.4+ thin server, preflight status page with generated ini snippets and a
-re-verify loop, Windows path handling. Success criterion: a Windows XAMPP user with Xdebug
-not yet configured reaches a rendered flame graph without leaving the tool or searching the
-web.
+Present milestone: **v0.15 — live in the project.** PHP 7.4+ thin server, preflight status
+page with generated ini snippets and a re-verify loop, the run store, `watch` mode, and both
+distributions (Composer dev-dependency and XAMPP/WAMP drop-in zip) built from the same code.
+Windows path handling throughout.
 
-Two things v0.1 left on the table that v0.15 should pick up:
+Success criterion: two audiences reach a rendered flame graph without leaving the tool — a
+Windows XAMPP user with Xdebug not yet configured, and a Composer user who runs one command
+in an existing project.
 
-- **Source annotation has no source.** The static build can only show line costs unless the user attaches a file by hand. `php-server` serving source files is what makes that view whole.
+Three things v0.1 left on the table that v0.15 should pick up:
+
+- **Source annotation has no source.** The static build can only show line costs unless the user attaches a file by hand. `php-server` serving source files is what makes that view whole, and in a project-installed build it needs no attaching at all.
+- **Run identity.** Nothing currently labels a profile. Until the store exists, every later feature is blocked on it.
 - **The Playwright gap above**, which should close before the renderer grows further.
+
+When starting v0.15, resolve these before writing much PHP: where the run store lives
+relative to a project root versus a drop-in install; how the route is captured (Xdebug
+filename specifiers, a trigger wrapper, or optional middleware); and what the manifest
+schema is, since the CLI and MCP server both read it.
